@@ -1,0 +1,10 @@
+.env
+.env.*
+node_modules/
+dist/
+keys/
+*.pem
+*.json.bak
+data/
+*.db
+*.log

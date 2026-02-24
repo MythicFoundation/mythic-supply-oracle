@@ -1,22 +1,26 @@
 /**
- * Mythic Supply Oracle v2
+ * Mythic Supply Oracle v3.1
  *
- * Canonical source of truth for $MYTH total & circulating supply,
- * real-time burn tracking, fee breakdown, and live price.
+ * Canonical source of truth for $MYTH total & circulating supply.
  *
- * Reads the on-chain FeeConfig PDA from the myth-token program to get
- * actual burn stats, fee splits, and distribution data.
+ * Supply model:
+ *   CANONICAL_TOTAL = 1,000,000,000 MYTH (constant)
+ *   l2Supply = getSupply() on L2 RPC (~503M native MYTH)
+ *   l1Supply = real L1 token supply via getTokenSupply(), fallback to CANONICAL - l2
+ *   totalSupply = l1 + l2
+ *   circulating = totalSupply - foundationBalance - bridgeLocked - burned
  *
  * Endpoints:
- *   GET /                    -> full supply + price data (v1 compat)
+ *   GET /                    -> full supply + price data
  *   GET /supply              -> total supply number (CoinGecko compat)
  *   GET /circulating         -> circulating supply (CoinGecko compat)
  *   GET /price               -> current price data
  *   GET /breakdown           -> supply breakdown by chain
  *   GET /api/v1/supply       -> structured API for explorer/frontends
- *   GET /api/supply          -> {totalSupply, burned, circulating, burnRate24h}
- *   GET /api/supply/stats    -> {feeBreakdown, validatorRewards, foundationTreasury}
+ *   GET /api/supply          -> backward compat (same as /api/v1/supply)
+ *   GET /api/supply/stats    -> fee breakdown, validator rewards, foundation
  *   GET /api/supply/history  -> burn history over time
+ *   GET /api/supply/validators -> validator info
  *   GET /health              -> health check
  */
 
@@ -41,63 +45,32 @@ function withTimeout(promise, ms = 10000) {
 // -- Config -------------------------------------------------------------------
 
 const PORT = parseInt(process.env.PORT || "4002", 10);
-const L1_RPC_URL = process.env.L1_RPC_URL || "http://MYTHIC_RPC_IP:8899";
+const L1_RPC_URL = process.env.L1_RPC_URL || "https://api.mainnet-beta.solana.com";
 const L2_RPC_URL = process.env.L2_RPC_URL || "http://127.0.0.1:8899";
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "10000", 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
 
 // MYTH token addresses
 const L1_MYTH_MINT = process.env.L1_MYTH_MINT || "5UP2iL9DefXC3yovX9b4XG2EiCnyxuVo3S2F6ik5pump";
-// L2 MYTH is the NATIVE chain token (like SOL), not an SPL mint
-// This variable is kept for backwards compat but L2 supply is fetched via getSupply RPC
-const L2_MYTH_MINT = process.env.L2_MYTH_MINT || "native";
 
 // Programs
 const L1_BRIDGE_PROGRAM = process.env.L1_BRIDGE_PROGRAM || "oEQfREm4FQkaVeRoxJHkJLB1feHprrntY6eJuW2zbqQ";
 const MYTH_TOKEN_PROGRAM = process.env.MYTH_TOKEN_PROGRAM || "7Hmyi9v4itEt49xo1fpTgHk1ytb8MZft7RBATBgb1pnf";
 
 // Fixed canonical total supply: 1 billion MYTH
-const TOTAL_SUPPLY = 1_000_000_000;
-const MYTH_DECIMALS = 9;
+const CANONICAL_TOTAL = parseInt(process.env.CANONICAL_SUPPLY || "1000000000", 10);
+const MYTH_DECIMALS = parseInt(process.env.MYTH_DECIMALS || "9", 10);
 
-// Foundation wallet
+// Foundation wallet (non-circulating bridge reserve on L2)
 const FOUNDATION_WALLET = process.env.FOUNDATION_WALLET || "AnVqSYE3ArJX9ZCbiReFcNa2JdLyri3GGGt34j63hT9e";
 
 // History config
 const HISTORY_FILE = path.join(__dirname, "data", "burn_history.json");
-const MAX_HISTORY_ENTRIES = 8640; // ~24h at 10s intervals
+const MAX_HISTORY_ENTRIES = 8640;
 
 // -- FeeConfig deserialization ------------------------------------------------
-// Must match the Borsh layout from programs/myth-token/src/lib.rs
 
-/**
- * FeeConfig on-chain layout (Borsh, 235 bytes):
- *   is_initialized: bool (1)
- *   admin: Pubkey (32)
- *   foundation_wallet: Pubkey (32)
- *   burn_address: Pubkey (32)
- *   myth_mint: Pubkey (32)
- *   gas_split: FeeSplit { validator_bps: u16, foundation_bps: u16, burn_bps: u16 } (6)
- *   compute_split: FeeSplit (6)
- *   inference_split: FeeSplit (6)
- *   bridge_split: FeeSplit (6)
- *   current_epoch: u64 (8)
- *   total_burned: u64 (8)
- *   total_distributed: u64 (8)
- *   total_foundation_collected: u64 (8)
- *   is_paused: bool (1)
- *   bump: u8 (1)
- *   gas_burned: u64 (8)
- *   compute_burned: u64 (8)
- *   inference_burned: u64 (8)
- *   bridge_burned: u64 (8)
- *   subnet_burned: u64 (8)
- *   total_foundation_burned: u64 (8)
- */
 function deserializeFeeConfig(data) {
-  if (!data || data.length < 235) {
-    return null;
-  }
-
+  if (!data || data.length < 235) return null;
   const buf = Buffer.from(data);
   let offset = 0;
 
@@ -137,21 +110,13 @@ function deserializeFeeConfig(data) {
   const totalFoundationBurned = readU64LE();
 
   return {
-    isInitialized,
-    admin,
-    foundationWallet,
-    burnAddress,
-    mythMint,
-    gasSplit,
-    computeSplit,
-    inferenceSplit,
-    bridgeSplit,
+    isInitialized, admin, foundationWallet, burnAddress, mythMint,
+    gasSplit, computeSplit, inferenceSplit, bridgeSplit,
     currentEpoch: Number(currentEpoch),
     totalBurned: Number(totalBurned),
     totalDistributed: Number(totalDistributed),
     totalFoundationCollected: Number(totalFoundationCollected),
-    isPaused,
-    bump,
+    isPaused, bump,
     gasBurned: Number(gasBurned),
     computeBurned: Number(computeBurned),
     inferenceBurned: Number(inferenceBurned),
@@ -162,9 +127,6 @@ function deserializeFeeConfig(data) {
 }
 
 // -- ValidatorFeeAccount deserialization --------------------------------------
-// Layout (69 bytes): validator(32) + stake_amount(8) + ai_capable(1) +
-//   reward_multiplier(2) + pending_rewards(8) + total_claimed(8) +
-//   registered_at(8) + is_active(1) + bump(1)
 
 function deserializeValidatorFeeAccount(data) {
   if (!data || data.length < 69) return null;
@@ -193,12 +155,13 @@ function deserializeValidatorFeeAccount(data) {
 // -- State --------------------------------------------------------------------
 
 let supplyData = {
-  totalSupply: TOTAL_SUPPLY,
-  circulatingSupply: TOTAL_SUPPLY,
+  totalSupply: CANONICAL_TOTAL,
+  l1Supply: 0,
+  l2Supply: 0,
+  bridgeLocked: 0,
+  foundationReserve: 0,
+  circulating: 0,
   burned: 0,
-  l1: { supply: TOTAL_SUPPLY, locked: 0, circulating: TOTAL_SUPPLY, mint: L1_MYTH_MINT },
-  l2: { supply: 0, mint: L2_MYTH_MINT },
-  bridge: { l1Program: L1_BRIDGE_PROGRAM, status: "synced", lastCheck: new Date().toISOString(), driftAmount: 0 },
   feeConfig: null,
   price: {
     usd: null, sol: null, marketCap: null, volume24h: null,
@@ -206,20 +169,14 @@ let supplyData = {
     source: null, lastUpdate: null,
     pumpfun: { bondingCurveComplete: null, replyCount: null, website: null },
   },
-  meta: {
-    name: "Mythic", symbol: "MYTH", decimals: MYTH_DECIMALS,
-    chain: "Solana L1 + Mythic L2", website: "https://mythic.sh",
-    totalSupplyRaw: (BigInt(TOTAL_SUPPLY) * BigInt(10 ** MYTH_DECIMALS)).toString(),
-  },
+  parityCheck: "",
   lastUpdated: new Date().toISOString(),
 };
 
-// Burn history: array of { timestamp, totalBurned, gasBurned, computeBurned, inferenceBurned, bridgeBurned, subnetBurned }
 let burnHistory = [];
 let last24hBurnSnapshot = { timestamp: Date.now(), totalBurned: 0 };
 let last7dBurnSnapshot = { timestamp: Date.now(), totalBurned: 0 };
 
-// Validator cache (refreshed every 60s, not every 10s — getProgramAccounts is expensive)
 let validatorCache = [];
 let lastValidatorFetch = 0;
 const VALIDATOR_POLL_MS = 60000;
@@ -233,7 +190,6 @@ function loadBurnHistory() {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         burnHistory = parsed.slice(-MAX_HISTORY_ENTRIES);
-        // Set 24h snapshot from history if available
         const cutoff = Date.now() - 24 * 60 * 60 * 1000;
         const oldEntry = burnHistory.find((e) => e.timestamp >= cutoff);
         if (oldEntry) {
@@ -278,9 +234,7 @@ async function fetchDexScreenerPrice() {
       pairAddress: pair.pairAddress,
       dexId: pair.dexId,
     };
-  } catch (err) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function fetchJupiterPrice() {
@@ -291,9 +245,7 @@ async function fetchJupiterPrice() {
     const tokenData = data.data?.[L1_MYTH_MINT];
     if (!tokenData) return null;
     return { usd: parseFloat(tokenData.price) || null, sol: null, marketCap: null, volume24h: null, priceChange24h: null, fdv: null, liquidity: null, source: "jupiter" };
-  } catch (err) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function fetchPumpFunData() {
@@ -302,16 +254,14 @@ async function fetchPumpFunData() {
     if (!res.ok) return null;
     const data = await res.json();
     return {
-      usd: data.usd_market_cap ? data.usd_market_cap / TOTAL_SUPPLY : null,
+      usd: data.usd_market_cap ? data.usd_market_cap / CANONICAL_TOTAL : null,
       marketCap: data.usd_market_cap || null,
       bondingCurveComplete: data.complete || null,
       replyCount: data.reply_count || null,
       website: data.website || null,
       source: "pumpfun",
     };
-  } catch (err) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function updatePrice() {
@@ -329,7 +279,7 @@ async function updatePrice() {
       marketCap: primary.marketCap || (pumpData?.marketCap ?? null),
       volume24h: primary.volume24h || null,
       priceChange24h: primary.priceChange24h || null,
-      fdv: primary.fdv || (primary.usd ? primary.usd * TOTAL_SUPPLY : null),
+      fdv: primary.fdv || (primary.usd ? primary.usd * CANONICAL_TOTAL : null),
       liquidity: primary.liquidity || null,
       source: primary.source,
       lastUpdate: new Date().toISOString(),
@@ -339,50 +289,41 @@ async function updatePrice() {
         website: pumpData?.website ?? null,
       },
     };
-    console.log(`[supply-oracle] Price: $${primary.usd?.toFixed(8) ?? "N/A"} (${primary.source})`);
   } else if (pumpData?.usd) {
     supplyData.price = {
       ...supplyData.price,
       usd: pumpData.usd,
       marketCap: pumpData.marketCap,
-      fdv: pumpData.usd * TOTAL_SUPPLY,
+      fdv: pumpData.usd * CANONICAL_TOTAL,
       source: "pumpfun",
       lastUpdate: new Date().toISOString(),
       pumpfun: { bondingCurveComplete: pumpData.bondingCurveComplete, replyCount: pumpData.replyCount, website: pumpData.website },
     };
   }
-  // Silently skip if no price data — token may not be listed yet
 }
 
-// -- Supply + FeeConfig Polling -----------------------------------------------
-
-async function fetchL1Supply() {
-  try {
-    const conn = new Connection(L1_RPC_URL, "confirmed");
-    const mintInfo = await withTimeout(conn.getParsedAccountInfo(new PublicKey(L1_MYTH_MINT)), 8000);
-    if (mintInfo.value && "parsed" in mintInfo.value.data) {
-      const parsed = mintInfo.value.data.parsed;
-      return { supply: parseFloat(parsed.info.supply) / (10 ** parsed.info.decimals), error: null };
-    }
-    return { supply: TOTAL_SUPPLY, error: "Could not parse L1 mint" };
-  } catch (err) {
-    return { supply: TOTAL_SUPPLY, error: err.message };
-  }
-}
+// -- Supply Polling -----------------------------------------------------------
 
 async function fetchL2Supply() {
-  // L2 MYTH is the native chain token (like SOL on Solana), not an SPL token.
-  // Use getSupply RPC to get total native token supply on L2.
   try {
     const conn = new Connection(L2_RPC_URL, "confirmed");
     const supplyResp = await withTimeout(conn.getSupply(), 8000);
     if (supplyResp && supplyResp.value) {
-      const totalLamports = supplyResp.value.total;
-      return { supply: totalLamports / 1e9, error: null };
+      return { supply: supplyResp.value.total / 1e9, error: null };
     }
     return { supply: 0, error: "Could not fetch L2 supply" };
   } catch (err) {
-    return { supply: 0, error: err.message };
+    return { supply: supplyData.l2Supply || 0, error: err.message };
+  }
+}
+
+async function fetchFoundationBalance() {
+  try {
+    const conn = new Connection(L2_RPC_URL, "confirmed");
+    const balance = await withTimeout(conn.getBalance(new PublicKey(FOUNDATION_WALLET)), 8000);
+    return { balance: balance / 1e9, error: null };
+  } catch (err) {
+    return { balance: supplyData.foundationReserve || 0, error: err.message };
   }
 }
 
@@ -420,11 +361,25 @@ async function fetchFeeConfig() {
     }
     const config = deserializeFeeConfig(accountInfo.data);
     if (!config) {
-      return { config: null, error: "FeeConfig not initialized or too small" };
+      return { config: null, error: "FeeConfig not initialized" };
     }
     return { config, error: null };
   } catch (err) {
     return { config: null, error: err.message };
+  }
+}
+
+async function fetchL1TokenSupply() {
+  try {
+    const conn = new Connection(L1_RPC_URL, "confirmed");
+    const mintPubkey = new PublicKey(L1_MYTH_MINT);
+    const supplyResp = await withTimeout(conn.getTokenSupply(mintPubkey), 8000);
+    if (supplyResp && supplyResp.value) {
+      return { supply: parseFloat(supplyResp.value.uiAmountString), error: null };
+    }
+    return { supply: 0, error: "Could not fetch L1 token supply" };
+  } catch (err) {
+    return { supply: 0, error: err.message };
   }
 }
 
@@ -434,71 +389,66 @@ async function fetchValidators() {
     const programId = new PublicKey(MYTH_TOKEN_PROGRAM);
     const accounts = await withTimeout(
       conn.getProgramAccounts(programId, {
-        filters: [{ dataSize: 69 }], // ValidatorFeeAccount is exactly 69 bytes
+        filters: [{ dataSize: 69 }],
       }),
       10000,
     );
     const validators = [];
     for (const { pubkey, account } of accounts) {
       const vfa = deserializeValidatorFeeAccount(account.data);
-      if (vfa) {
-        validators.push({ address: pubkey.toBase58(), ...vfa });
-      }
+      if (vfa) validators.push({ address: pubkey.toBase58(), ...vfa });
     }
     return validators;
   } catch (err) {
     console.log(`[supply-oracle] Validator fetch failed: ${err.message}`);
-    return null; // keep previous cache
-  }
-}
-
-async function fetchFoundationBalance() {
-  try {
-    const conn = new Connection(L2_RPC_URL, "confirmed");
-    const balance = await withTimeout(conn.getBalance(new PublicKey(FOUNDATION_WALLET)), 8000);
-    return { balance: balance / 1e9, error: null };
-  } catch (err) {
-    return { balance: 0, error: err.message };
+    return null;
   }
 }
 
 async function updateSupplyData() {
-  const [l1Result, l2Result, bridgeResult, feeConfigResult, foundationResult] = await Promise.all([
-    fetchL1Supply(),
+  const [l2Result, foundationResult, bridgeResult, feeConfigResult, l1TokenResult] = await Promise.all([
     fetchL2Supply(),
+    fetchFoundationBalance(),
     fetchBridgeLocked(),
     fetchFeeConfig(),
-    fetchFoundationBalance(),
+    fetchL1TokenSupply(),
   ]);
 
-  const l1Supply = l1Result.supply;
   const l2Supply = l2Result.supply;
+  // Use real L1 token supply if available, otherwise fallback to canonical - l2
+  const l1Supply = l1TokenResult.supply > 0 ? l1TokenResult.supply : (CANONICAL_TOTAL - l2Supply);
+  const totalSupply = l1Supply + l2Supply;
   const bridgeLocked = bridgeResult.locked;
-  const l1Circulating = l1Supply - bridgeLocked;
-  const drift = Math.abs(l2Supply - bridgeLocked);
-  const driftStatus = drift > 1 ? "drift_detected" : "synced";
+  const foundationBalance = foundationResult.balance;
 
-  // Burn stats from on-chain FeeConfig (in lamports, convert to MYTH)
+  // Burn stats from on-chain FeeConfig
   let totalBurnedMYTH = 0;
   let feeConfig = supplyData.feeConfig;
-
   if (feeConfigResult.config) {
     feeConfig = feeConfigResult.config;
     totalBurnedMYTH = feeConfig.totalBurned / 1e9;
   }
 
-  const circulatingSupply = TOTAL_SUPPLY - totalBurnedMYTH;
+  // Circulating = totalSupply - foundation reserve - bridge locked - burned
+  const circulating = totalSupply - foundationBalance - bridgeLocked - totalBurnedMYTH;
+
+  // Parity check: l1 + l2 should approximately equal totalSupply
+  const parityDrift = Math.abs(totalSupply - CANONICAL_TOTAL);
+  const parityCheck = parityDrift < 1
+    ? `l1 + l2 = ${Math.round(totalSupply)} OK`
+    : `l1(${l1Supply.toFixed(0)}) + l2(${l2Supply.toFixed(0)}) = ${totalSupply.toFixed(0)} (drift: ${parityDrift.toFixed(0)} from canonical)`;
 
   supplyData = {
     ...supplyData,
-    totalSupply: TOTAL_SUPPLY,
-    circulatingSupply,
+    totalSupply: Math.round(totalSupply * 100) / 100,
+    l1Supply: Math.round(l1Supply * 100) / 100,
+    l2Supply: Math.round(l2Supply * 100) / 100,
+    bridgeLocked,
+    foundationReserve: Math.round(foundationBalance * 100) / 100,
+    circulating: Math.round(circulating * 100) / 100,
     burned: totalBurnedMYTH,
-    l1: { ...supplyData.l1, supply: l1Supply, locked: bridgeLocked, circulating: l1Circulating },
-    l2: { ...supplyData.l2, supply: l2Supply },
-    bridge: { ...supplyData.bridge, status: driftStatus, lastCheck: new Date().toISOString(), driftAmount: drift },
     feeConfig,
-    foundationBalance: foundationResult.balance,
+    parityCheck,
     lastUpdated: new Date().toISOString(),
   };
 
@@ -518,43 +468,34 @@ async function updateSupplyData() {
     burnHistory = burnHistory.slice(-MAX_HISTORY_ENTRIES);
   }
 
-  // Update 24h burn snapshot — find the entry from ~24h ago
+  // Update 24h/7d burn snapshots
   const cutoff24h = now - 24 * 60 * 60 * 1000;
   const oldEntry24h = burnHistory.find((e) => e.timestamp >= cutoff24h);
-  if (oldEntry24h) {
-    last24hBurnSnapshot = { timestamp: oldEntry24h.timestamp, totalBurned: oldEntry24h.totalBurned };
-  }
+  if (oldEntry24h) last24hBurnSnapshot = { timestamp: oldEntry24h.timestamp, totalBurned: oldEntry24h.totalBurned };
 
-  // Update 7d burn snapshot
   const cutoff7d = now - 7 * 24 * 60 * 60 * 1000;
   const oldEntry7d = burnHistory.find((e) => e.timestamp >= cutoff7d);
-  if (oldEntry7d) {
-    last7dBurnSnapshot = { timestamp: oldEntry7d.timestamp, totalBurned: oldEntry7d.totalBurned };
-  }
+  if (oldEntry7d) last7dBurnSnapshot = { timestamp: oldEntry7d.timestamp, totalBurned: oldEntry7d.totalBurned };
 
-  // Refresh validator cache every VALIDATOR_POLL_MS
+  // Refresh validator cache
   if (now - lastValidatorFetch > VALIDATOR_POLL_MS) {
     const validators = await fetchValidators();
-    if (validators !== null) {
-      validatorCache = validators;
-    }
+    if (validators !== null) validatorCache = validators;
     lastValidatorFetch = now;
   }
 
-  // Save history every 60 entries (~10 minutes at 10s interval)
-  if (burnHistory.length % 60 === 0) {
-    saveBurnHistory();
-  }
+  // Save history periodically
+  if (burnHistory.length % 60 === 0) saveBurnHistory();
 
   // Update price
   await updatePrice();
 
-  const errors = [l1Result.error, l2Result.error, bridgeResult.error, feeConfigResult.error, foundationResult.error].filter(Boolean);
+  const errors = [l2Result.error, foundationResult.error, bridgeResult.error, feeConfigResult.error, l1TokenResult.error].filter(Boolean);
   if (errors.length > 0) {
     console.log(`[supply-oracle] Update with warnings: ${errors.join(", ")}`);
   } else {
     console.log(
-      `[supply-oracle] Total: ${TOTAL_SUPPLY} | Burned: ${totalBurnedMYTH} | Circ: ${circulatingSupply} | L1: ${l1Supply} (${bridgeLocked} locked) | L2: ${l2Supply}`,
+      `[supply-oracle] L1: ${l1Supply.toFixed(0)} | L2: ${l2Supply.toFixed(0)} | Total: ${totalSupply.toFixed(0)} | ${parityCheck}`,
     );
   }
 }
@@ -564,20 +505,20 @@ async function updateSupplyData() {
 const app = express();
 app.use(cors());
 
-// Full supply + price data (v1 compat)
+// Full supply data (root endpoint)
 app.get("/", (_req, res) => {
   const { feeConfig: _fc, ...safeData } = supplyData;
   res.json(safeData);
 });
 
-// CoinGecko/CoinMarketCap compatible — total supply
+// CoinGecko compat - total supply (plain text)
 app.get("/supply", (_req, res) => {
-  res.type("text/plain").send(TOTAL_SUPPLY.toString());
+  res.type("text/plain").send(Math.round(supplyData.totalSupply).toString());
 });
 
-// CoinGecko/CoinMarketCap compatible — circulating supply
+// CoinGecko compat - circulating supply (plain text)
 app.get("/circulating", (_req, res) => {
-  res.type("text/plain").send(supplyData.circulatingSupply.toString());
+  res.type("text/plain").send(Math.round(supplyData.circulating).toString());
 });
 
 // Price endpoint
@@ -601,25 +542,29 @@ app.get("/price", (_req, res) => {
 // Supply breakdown by chain
 app.get("/breakdown", (_req, res) => {
   res.json({
-    total: TOTAL_SUPPLY,
+    total: supplyData.totalSupply,
     burned: supplyData.burned,
-    circulating: supplyData.circulatingSupply,
-    l1: { circulating: supplyData.l1.circulating, locked: supplyData.l1.locked },
-    l2: { circulating: supplyData.l2.supply },
-    bridgeStatus: supplyData.bridge.status,
+    circulating: supplyData.circulating,
+    l1: { supply: supplyData.l1Supply },
+    l2: { supply: supplyData.l2Supply },
+    bridgeLocked: supplyData.bridgeLocked,
+    foundationReserve: supplyData.foundationReserve,
+    parityCheck: supplyData.parityCheck,
     price: supplyData.price.usd,
   });
 });
 
-// API for explorer and frontends (v1 compat)
+// Structured API for explorer/frontends (v1)
 app.get("/api/v1/supply", (_req, res) => {
   res.json({
-    totalSupply: TOTAL_SUPPLY,
-    circulatingSupply: supplyData.circulatingSupply,
+    totalSupply: supplyData.totalSupply,
+    l1Supply: supplyData.l1Supply,
+    l2Supply: supplyData.l2Supply,
+    bridgeLocked: supplyData.bridgeLocked,
+    foundationReserve: supplyData.foundationReserve,
+    circulating: supplyData.circulating,
     burned: supplyData.burned,
-    l1Supply: supplyData.l1.circulating,
-    l2Supply: supplyData.l2.supply,
-    bridgeLocked: supplyData.l1.locked,
+    parityCheck: supplyData.parityCheck,
     symbol: "MYTH",
     decimals: MYTH_DECIMALS,
     price: supplyData.price.usd,
@@ -629,22 +574,21 @@ app.get("/api/v1/supply", (_req, res) => {
   });
 });
 
-// --- NEW: /api/supply --------------------------------------------------------
-
+// Backward compat - /api/supply (same as /api/v1/supply)
 app.get("/api/supply", (_req, res) => {
   const fc = supplyData.feeConfig;
   const totalBurnedLamports = fc ? fc.totalBurned : 0;
   const totalBurnedMYTH = totalBurnedLamports / 1e9;
-
-  // Compute burn rates
   const nowBurned = totalBurnedLamports;
   const burnRate24h = (nowBurned - last24hBurnSnapshot.totalBurned) / 1e9;
   const burnRateWeek = (nowBurned - last7dBurnSnapshot.totalBurned) / 1e9;
 
   res.json({
-    totalSupply: TOTAL_SUPPLY,
+    totalSupply: supplyData.totalSupply,
+    l1Supply: supplyData.l1Supply,
+    l2Supply: supplyData.l2Supply,
     burned: totalBurnedMYTH,
-    circulating: TOTAL_SUPPLY - totalBurnedMYTH,
+    circulating: supplyData.circulating,
     burnRate24h,
     burnRateWeek,
     decimals: MYTH_DECIMALS,
@@ -652,11 +596,9 @@ app.get("/api/supply", (_req, res) => {
   });
 });
 
-// --- NEW: /api/supply/stats --------------------------------------------------
-
+// Fee stats
 app.get("/api/supply/stats", (_req, res) => {
   const fc = supplyData.feeConfig;
-
   const toMYTH = (lamports) => (lamports || 0) / 1e9;
 
   const feeBreakdown = {
@@ -674,7 +616,7 @@ app.get("/api/supply/stats", (_req, res) => {
     validatorRewards: toMYTH(fc?.totalDistributed),
     foundationTreasury: {
       collected: toMYTH(fc?.totalFoundationCollected),
-      balance: supplyData.foundationBalance || 0,
+      balance: supplyData.foundationReserve || 0,
       wallet: FOUNDATION_WALLET,
     },
     currentEpoch: fc?.currentEpoch || 0,
@@ -683,18 +625,12 @@ app.get("/api/supply/stats", (_req, res) => {
   });
 });
 
-// --- NEW: /api/supply/history ------------------------------------------------
-
+// Burn history
 app.get("/api/supply/history", (req, res) => {
-  // Optional query params: ?period=1h|6h|24h (default 24h), ?limit=100
   const period = req.query.period || "24h";
   const limit = Math.min(parseInt(req.query.limit || "500", 10), MAX_HISTORY_ENTRIES);
 
-  const periodMs = {
-    "1h": 60 * 60 * 1000,
-    "6h": 6 * 60 * 60 * 1000,
-    "24h": 24 * 60 * 60 * 1000,
-  };
+  const periodMs = { "1h": 3600000, "6h": 21600000, "24h": 86400000 };
   const cutoff = Date.now() - (periodMs[period] || periodMs["24h"]);
 
   const filtered = burnHistory
@@ -710,15 +646,10 @@ app.get("/api/supply/history", (req, res) => {
       subnetBurned: e.subnetBurned / 1e9,
     }));
 
-  res.json({
-    period,
-    entries: filtered.length,
-    history: filtered,
-  });
+  res.json({ period, entries: filtered.length, history: filtered });
 });
 
-// --- NEW: /api/supply/validators ---------------------------------------------
-
+// Validators
 app.get("/api/supply/validators", (_req, res) => {
   const toMYTH = (lamports) => (lamports || 0) / 1e9;
 
@@ -758,7 +689,7 @@ app.get("/health", (_req, res) => {
     status: healthy ? "ok" : "stale",
     lastUpdated: supplyData.lastUpdated,
     ageMs: age,
-    bridgeStatus: supplyData.bridge.status,
+    parityCheck: supplyData.parityCheck,
     priceSource: supplyData.price.source,
     feeConfigLoaded: supplyData.feeConfig !== null,
     pollIntervalMs: POLL_INTERVAL_MS,
@@ -768,11 +699,11 @@ app.get("/health", (_req, res) => {
 // -- Start --------------------------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log(`[supply-oracle] Mythic Supply Oracle v2 on port ${PORT}`);
-  console.log(`[supply-oracle] Total supply: ${TOTAL_SUPPLY.toLocaleString()} MYTH`);
-  console.log(`[supply-oracle] L1 RPC: ${L1_RPC_URL}`);
+  console.log(`[supply-oracle] Mythic Supply Oracle v3.1 on port ${PORT}`);
+  console.log(`[supply-oracle] Canonical supply: ${CANONICAL_TOTAL.toLocaleString()} MYTH`);
+  console.log(`[supply-oracle] L1 MYTH mint: ${L1_MYTH_MINT}`);
   console.log(`[supply-oracle] L2 RPC: ${L2_RPC_URL}`);
-  console.log(`[supply-oracle] MYTH Token Program: ${MYTH_TOKEN_PROGRAM}`);
+  console.log(`[supply-oracle] Foundation wallet: ${FOUNDATION_WALLET}`);
   console.log(`[supply-oracle] Polling every ${POLL_INTERVAL_MS}ms`);
 
   loadBurnHistory();
