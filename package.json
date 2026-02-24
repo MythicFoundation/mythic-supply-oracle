@@ -1,7 +1,7 @@
 {
   "name": "mythic-supply-oracle",
-  "version": "1.0.0",
-  "description": "Canonical MYTH supply oracle — tracks circulating supply across L1 Solana and Mythic L2",
+  "version": "2.0.0",
+  "description": "Canonical MYTH supply oracle — tracks circulating supply, burns, and fees across L1 Solana and Mythic L2",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
+    "borsh": "^2.0.0",
     "express": "^4.21.0",
     "cors": "^2.8.5"
   }
