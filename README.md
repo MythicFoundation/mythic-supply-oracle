@@ -4,7 +4,7 @@
 
 [![API](https://img.shields.io/badge/oracle-mythic.sh:4002-39FF14?style=flat-square)](https://mythic.sh)
 [![Built by](https://img.shields.io/badge/built%20by-MythicLabs-7B2FFF?style=flat-square)](https://mythiclabs.io)
-[![License: MIT](https://img.shields.io/badge/license-MIT-39FF14?style=flat-square)](./LICENSE)
+![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL_1.1-blue.svg)
 [![Node.js](https://img.shields.io/badge/node.js-18+-339933?style=flat-square&logo=node.js)](https://nodejs.org)
 
 **Canonical source of truth for $MYTH total supply, circulating supply, burn tracking, and fee distribution.**
@@ -203,12 +203,5 @@ All RPC calls use a 10-second timeout to prevent stalls.
 
 ## License
 
-This project is licensed under the [MIT License](./LICENSE).
 
----
-
-<div align="center">
-
-Built by [MythicLabs](https://mythiclabs.io) &middot; [mythic.sh](https://mythic.sh) &middot; [Twitter](https://x.com/Mythic_L2) &middot; [GitHub](https://github.com/MythicFoundation)
-
-</div>
+This project is licensed under the [Business Source License 1.1](./LICENSE). The Licensed Work will convert to MIT License on February 25, 2028.
