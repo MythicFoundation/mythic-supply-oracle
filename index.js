@@ -56,6 +56,10 @@ const L1_MYTH_MINT = process.env.L1_MYTH_MINT || "5UP2iL9DefXC3yovX9b4XG2EiCnyxu
 const L1_BRIDGE_PROGRAM = process.env.L1_BRIDGE_PROGRAM || "oEQfREm4FQkaVeRoxJHkJLB1feHprrntY6eJuW2zbqQ";
 const MYTH_TOKEN_PROGRAM = process.env.MYTH_TOKEN_PROGRAM || "7Hmyi9v4itEt49xo1fpTgHk1ytb8MZft7RBATBgb1pnf";
 
+// L2 MYTH SPL token mint (6 decimals)
+const L2_MYTH_MINT = process.env.L2_MYTH_MINT || "7sfazeMxmuoDkuU5fHkDGin8uYuaTkZrRSwJM1CHXvDq";
+const L2_MYTH_DECIMALS = 6;
+
 // Fixed canonical total supply: 1 billion MYTH
 const CANONICAL_TOTAL = parseInt(process.env.CANONICAL_SUPPLY || "1000000000", 10);
 const MYTH_DECIMALS = parseInt(process.env.MYTH_DECIMALS || "9", 10);
@@ -307,11 +311,12 @@ async function updatePrice() {
 async function fetchL2Supply() {
   try {
     const conn = new Connection(L2_RPC_URL, "confirmed");
-    const supplyResp = await withTimeout(conn.getSupply(), 8000);
+    const mintPubkey = new PublicKey(L2_MYTH_MINT);
+    const supplyResp = await withTimeout(conn.getTokenSupply(mintPubkey), 8000);
     if (supplyResp && supplyResp.value) {
-      return { supply: supplyResp.value.total / 1e9, error: null };
+      return { supply: parseFloat(supplyResp.value.uiAmountString), error: null };
     }
-    return { supply: 0, error: "Could not fetch L2 supply" };
+    return { supply: 0, error: "Could not fetch L2 MYTH token supply" };
   } catch (err) {
     return { supply: supplyData.l2Supply || 0, error: err.message };
   }
@@ -415,8 +420,9 @@ async function updateSupplyData() {
   ]);
 
   const l2Supply = l2Result.supply;
-  // Use real L1 token supply if available, otherwise fallback to canonical - l2
-  const l1Supply = l1TokenResult.supply > 0 ? l1TokenResult.supply : (CANONICAL_TOTAL - l2Supply);
+  // L1 supply = PumpFun token supply (real on-chain)
+  // L2 supply = L2 MYTH mint supply (real on-chain, post-burn)
+  const l1Supply = l1TokenResult.supply || 0;
   const totalSupply = l1Supply + l2Supply;
   const bridgeLocked = bridgeResult.locked;
   const foundationBalance = foundationResult.balance;
@@ -430,7 +436,9 @@ async function updateSupplyData() {
   }
 
   // Circulating = totalSupply - foundation reserve - bridge locked - burned
-  const circulating = totalSupply - foundationBalance - bridgeLocked - totalBurnedMYTH;
+  // Circulating = L1 token supply (PumpFun minted). No inflation, no lockups.
+  // Foundation tokens are in circulation too — they were bought/received on the open market.
+  const circulating = l1Supply;
 
   // Parity check: l1 + l2 should approximately equal totalSupply
   const parityDrift = Math.abs(totalSupply - CANONICAL_TOTAL);
